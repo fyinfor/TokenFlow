@@ -220,6 +220,18 @@ jobs:
             echo "==> Created .env with generated secrets"
           fi
 
+          # 避免与本机已有 sub2api 容器名/端口冲突
+          if [[ "$TARGET_NAME" == "maga" ]]; then
+            HOST_APP_PORT=8081
+          else
+            HOST_APP_PORT=8080
+          fi
+          if grep -q '^SERVER_PORT=' .env; then
+            sed -i "s/^SERVER_PORT=.*/SERVER_PORT=${HOST_APP_PORT}/" .env
+          else
+            echo "SERVER_PORT=${HOST_APP_PORT}" >> .env
+          fi
+
           echo "==> Docker login ($REGISTRY_KIND) for ${TARGET_NAME}"
           if [[ "$REGISTRY_KIND" == "ghcr" ]]; then
             echo "$GHCR_TOKEN" | "${DOCKER[@]}" login ghcr.io -u "$GHCR_USER" --password-stdin
@@ -232,27 +244,35 @@ jobs:
           echo "==> Pull $IMAGE_FULL"
           "${DOCKER[@]}" pull "$IMAGE_FULL"
 
+          # 独立容器名 + 项目名，不与已有 sub2api 栈冲突
           printf '%s\n' \
-            "services:" \
-            "  sub2api:" \
+            'services:' \
+            '  sub2api:' \
             "    image: ${IMAGE_FULL}" \
-            "    container_name: tokenflow" \
+            '    container_name: tokenflow' \
+            '    ports:' \
+            "      - \"\${BIND_HOST:-0.0.0.0}:\${SERVER_PORT:-${HOST_APP_PORT}}:8080\"" \
+            '  postgres:' \
+            '    container_name: tokenflow-postgres' \
+            '  redis:' \
+            '    container_name: tokenflow-redis' \
             > docker-compose.tokenflow.override.yml
 
+          export COMPOSE_PROJECT_NAME=tokenflow
           if "${DOCKER[@]}" compose version >/dev/null 2>&1; then
-            COMPOSE=("${DOCKER[@]}" compose -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
+            COMPOSE=("${DOCKER[@]}" compose -p tokenflow -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
           else
             if [[ "${DOCKER[*]}" == "sudo docker" ]]; then
-              COMPOSE=(sudo docker-compose -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
+              COMPOSE=(sudo env COMPOSE_PROJECT_NAME=tokenflow docker-compose -p tokenflow -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
             else
-              COMPOSE=(docker-compose -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
+              COMPOSE=(env COMPOSE_PROJECT_NAME=tokenflow docker-compose -p tokenflow -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
             fi
           fi
 
-          echo "==> Starting TokenFlow on ${TARGET_NAME} at $HOME/$REMOTE_DIR"
+          echo "==> Starting TokenFlow on ${TARGET_NAME} at $HOME/$REMOTE_DIR (port ${HOST_APP_PORT})"
           "${COMPOSE[@]}" up -d
           "${COMPOSE[@]}" ps
-          "${DOCKER[@]}" ps --filter "name=tokenflow" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+          "${DOCKER[@]}" ps --filter "name=tokenflow" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
           echo "==> Done (${TARGET_NAME})"
           REMOTE
 
@@ -264,4 +284,9 @@ jobs:
             echo "- Registry: \`${{ steps.host.outputs.registry_kind }}\`"
             echo "- Image: \`${{ steps.host.outputs.image_full }}\`"
             echo "- Dir: \`~/${{ env.REMOTE_DIR }}\`"
+            if [[ "${{ matrix.target }}" == "maga" ]]; then
+              echo "- App port: \`8081\` (避免与已有 sub2api:8080 冲突)"
+            else
+              echo "- App port: \`8080\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
