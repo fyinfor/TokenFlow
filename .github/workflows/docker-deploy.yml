@@ -1,5 +1,5 @@
-# Deploy TokenFlow to a remote host over SSH (key auth).
-# Configure host/path/credentials in GitHub Settings → Secrets and variables → Actions.
+# Deploy TokenFlow over SSH. Host/path auto-detected from running container — no Variables needed.
+# Secrets only: LOCAL_SERVER_IP_maga, DEPLOY_USER, DEPLOY_SSH_PRIVATE_KEY, ACR_*, optional DEPLOY_SSH_PORT
 name: 本地服务器IP_maga
 
 on:
@@ -30,6 +30,8 @@ env:
   ACR_REGISTRY: crpi-sk2z151c9de4cnvh.cn-hangzhou.personal.cr.aliyuncs.com
   ACR_NAMESPACE: fyinfor123
   ACR_REPO: tokenflow
+  # 服务器上已有的应用容器名（用来自动定位 compose 目录）
+  APP_CONTAINER: sub2api
 
 jobs:
   deploy:
@@ -87,9 +89,6 @@ jobs:
           LOCAL_SERVER_IP_maga: ${{ secrets.LOCAL_SERVER_IP_maga }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
-          DEPLOY_COMPOSE_FILE: ${{ vars.DEPLOY_COMPOSE_FILE || 'docker-compose.yml' }}
-          DEPLOY_SERVICE: ${{ vars.DEPLOY_SERVICE || 'sub2api' }}
           IMAGE_FULL: ${{ steps.meta.outputs.full }}
           REGISTRY_KIND: ${{ inputs.registry }}
           ACR_REGISTRY: ${{ env.ACR_REGISTRY }}
@@ -97,56 +96,86 @@ jobs:
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
+          APP_CONTAINER: ${{ env.APP_CONTAINER }}
         run: |
           set -euo pipefail
 
           : "${LOCAL_SERVER_IP_maga:?set secret LOCAL_SERVER_IP_maga}"
           : "${DEPLOY_USER:?set secret DEPLOY_USER}"
-          : "${DEPLOY_PATH:?set variable DEPLOY_PATH}"
 
           SSH=(ssh -i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT"
             -o IdentitiesOnly=yes
             -o StrictHostKeyChecking=accept-new
             "${DEPLOY_USER}@${LOCAL_SERVER_IP_maga}")
 
-          # Pass only needed values into the remote shell
           "${SSH[@]}" \
             IMAGE_FULL="$IMAGE_FULL" \
-            DEPLOY_PATH="$DEPLOY_PATH" \
-            DEPLOY_COMPOSE_FILE="$DEPLOY_COMPOSE_FILE" \
-            DEPLOY_SERVICE="$DEPLOY_SERVICE" \
             REGISTRY_KIND="$REGISTRY_KIND" \
             ACR_REGISTRY="$ACR_REGISTRY" \
             ACR_USERNAME="$ACR_USERNAME" \
             ACR_PASSWORD="$ACR_PASSWORD" \
             GHCR_USER="$GHCR_USER" \
             GHCR_TOKEN="$GHCR_TOKEN" \
+            APP_CONTAINER="$APP_CONTAINER" \
             bash -s <<'REMOTE'
           set -euo pipefail
 
-          echo "==> Deploy dir: $DEPLOY_PATH"
+          if docker info >/dev/null 2>&1; then
+            DOCKER=(docker)
+          elif sudo -n docker info >/dev/null 2>&1; then
+            DOCKER=(sudo docker)
+          else
+            echo "Cannot run docker on remote host (need docker or passwordless sudo)" >&2
+            exit 1
+          fi
+
+          if ! "${DOCKER[@]}" inspect "$APP_CONTAINER" >/dev/null 2>&1; then
+            echo "Container '$APP_CONTAINER' not found on server" >&2
+            exit 1
+          fi
+
+          DEPLOY_PATH="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$APP_CONTAINER")"
+          CONFIG_FILES="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$APP_CONTAINER")"
+          DEPLOY_SERVICE="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$APP_CONTAINER")"
+          DEPLOY_COMPOSE_FILE="${CONFIG_FILES%%,*}"
+          DEPLOY_COMPOSE_FILE="$(basename "$DEPLOY_COMPOSE_FILE")"
+
+          if [[ -z "$DEPLOY_PATH" || -z "$DEPLOY_SERVICE" ]]; then
+            echo "Container '$APP_CONTAINER' is not managed by docker compose (missing labels)" >&2
+            exit 1
+          fi
+
+          echo "==> Auto-detected"
+          echo "    path:    $DEPLOY_PATH"
+          echo "    compose: $DEPLOY_COMPOSE_FILE"
+          echo "    service: $DEPLOY_SERVICE"
           cd "$DEPLOY_PATH"
 
           echo "==> Docker login ($REGISTRY_KIND)"
           if [[ "$REGISTRY_KIND" == "ghcr" ]]; then
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            echo "$GHCR_TOKEN" | "${DOCKER[@]}" login ghcr.io -u "$GHCR_USER" --password-stdin
           else
-            echo "$ACR_PASSWORD" | docker login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
+            echo "$ACR_PASSWORD" | "${DOCKER[@]}" login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
           fi
 
           echo "==> Pull $IMAGE_FULL"
-          docker pull "$IMAGE_FULL"
+          "${DOCKER[@]}" pull "$IMAGE_FULL"
 
-          # Override only the app service image; leave postgres/redis untouched
           printf '%s\n' \
             "services:" \
             "  ${DEPLOY_SERVICE}:" \
             "    image: ${IMAGE_FULL}" \
             > docker-compose.tokenflow.override.yml
 
-          COMPOSE=(docker compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
-          if ! docker compose version >/dev/null 2>&1; then
-            COMPOSE=(docker-compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+          if "${DOCKER[@]}" compose version >/dev/null 2>&1; then
+            COMPOSE=("${DOCKER[@]}" compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+          else
+            # legacy docker-compose binary
+            if [[ "${DOCKER[*]}" == "sudo docker" ]]; then
+              COMPOSE=(sudo docker-compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+            else
+              COMPOSE=(docker-compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+            fi
           fi
 
           echo "==> Recreate service: $DEPLOY_SERVICE"
@@ -154,7 +183,7 @@ jobs:
 
           echo "==> Status"
           "${COMPOSE[@]}" ps "$DEPLOY_SERVICE" || true
-          docker image ls --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}' | grep -F "$IMAGE_FULL" || true
+          "${DOCKER[@]}" ps --filter "name=^/${APP_CONTAINER}$" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
           echo "==> Done"
           REMOTE
 
@@ -164,6 +193,6 @@ jobs:
             echo "## Deployed"
             echo ""
             echo "- Host: \`${{ secrets.LOCAL_SERVER_IP_maga }}\`"
-            echo "- Path: \`${{ vars.DEPLOY_PATH }}\`"
             echo "- Image: \`${{ steps.meta.outputs.full }}\`"
+            echo "- Path/service: auto-detected from container \`sub2api\`"
           } >> "$GITHUB_STEP_SUMMARY"
