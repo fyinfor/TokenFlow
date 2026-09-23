@@ -2,7 +2,7 @@
 # - maga (本机) → GHCR 镜像
 # - tokease-slave (远程) → ACR 镜像
 # 默认两台一起部署，可选手动目标；slave 使用独立 SSH 密钥。
-name: 本地服务器IP_maga
+name: Deploy TokenFlow
 
 on:
   workflow_dispatch:
