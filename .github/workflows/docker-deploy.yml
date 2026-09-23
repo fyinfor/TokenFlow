@@ -1,0 +1,169 @@
+# Deploy TokenFlow to a remote host over SSH (key auth).
+# Configure host/path/credentials in GitHub Settings → Secrets and variables → Actions.
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: '要部署的镜像标签（如 1.0.0 / latest）'
+        required: true
+        type: string
+      registry:
+        description: '镜像来源'
+        required: true
+        type: choice
+        options:
+          - acr
+          - ghcr
+        default: acr
+
+concurrency:
+  group: deploy-tokenflow
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  ACR_REGISTRY: crpi-sk2z151c9de4cnvh.cn-hangzhou.personal.cr.aliyuncs.com
+  ACR_NAMESPACE: fyinfor123
+  ACR_REPO: tokenflow
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve image
+        id: meta
+        run: |
+          set -euo pipefail
+          RAW="${{ inputs.image_tag }}"
+          RAW="$(echo "$RAW" | xargs)"
+          VERSION="${RAW#v}"
+          if [[ -z "$VERSION" ]]; then
+            echo "image_tag is required" >&2
+            exit 1
+          fi
+
+          if [[ "${{ inputs.registry }}" == "ghcr" ]]; then
+            IMAGE="ghcr.io/${{ github.repository_owner }}/tokenflow"
+          else
+            IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPO}"
+          fi
+
+          {
+            echo "version=${VERSION}"
+            echo "image=${IMAGE}"
+            echo "full=${IMAGE}:${VERSION}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Deploy target: ${IMAGE}:${VERSION}"
+
+      - name: Prepare SSH key
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DEPLOY_SSH_PRIVATE_KEY}" ]]; then
+            echo "Missing secret DEPLOY_SSH_PRIVATE_KEY" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          HOST="${{ secrets.DEPLOY_HOST }}"
+          PORT="${{ secrets.DEPLOY_SSH_PORT || '22' }}"
+          if [[ -z "$HOST" ]]; then
+            echo "Missing secret DEPLOY_HOST" >&2
+            exit 1
+          fi
+          ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deploy over SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          DEPLOY_COMPOSE_FILE: ${{ vars.DEPLOY_COMPOSE_FILE || 'docker-compose.yml' }}
+          DEPLOY_SERVICE: ${{ vars.DEPLOY_SERVICE || 'sub2api' }}
+          IMAGE_FULL: ${{ steps.meta.outputs.full }}
+          REGISTRY_KIND: ${{ inputs.registry }}
+          ACR_REGISTRY: ${{ env.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          : "${DEPLOY_HOST:?set secret DEPLOY_HOST}"
+          : "${DEPLOY_USER:?set secret DEPLOY_USER}"
+          : "${DEPLOY_PATH:?set variable DEPLOY_PATH}"
+
+          SSH=(ssh -i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT"
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=accept-new
+            "${DEPLOY_USER}@${DEPLOY_HOST}")
+
+          # Pass only needed values into the remote shell
+          "${SSH[@]}" \
+            IMAGE_FULL="$IMAGE_FULL" \
+            DEPLOY_PATH="$DEPLOY_PATH" \
+            DEPLOY_COMPOSE_FILE="$DEPLOY_COMPOSE_FILE" \
+            DEPLOY_SERVICE="$DEPLOY_SERVICE" \
+            REGISTRY_KIND="$REGISTRY_KIND" \
+            ACR_REGISTRY="$ACR_REGISTRY" \
+            ACR_USERNAME="$ACR_USERNAME" \
+            ACR_PASSWORD="$ACR_PASSWORD" \
+            GHCR_USER="$GHCR_USER" \
+            GHCR_TOKEN="$GHCR_TOKEN" \
+            bash -s <<'REMOTE'
+          set -euo pipefail
+
+          echo "==> Deploy dir: $DEPLOY_PATH"
+          cd "$DEPLOY_PATH"
+
+          echo "==> Docker login ($REGISTRY_KIND)"
+          if [[ "$REGISTRY_KIND" == "ghcr" ]]; then
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          else
+            echo "$ACR_PASSWORD" | docker login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
+          fi
+
+          echo "==> Pull $IMAGE_FULL"
+          docker pull "$IMAGE_FULL"
+
+          # Override only the app service image; leave postgres/redis untouched
+          printf '%s\n' \
+            "services:" \
+            "  ${DEPLOY_SERVICE}:" \
+            "    image: ${IMAGE_FULL}" \
+            > docker-compose.tokenflow.override.yml
+
+          COMPOSE=(docker compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+          if ! docker compose version >/dev/null 2>&1; then
+            COMPOSE=(docker-compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+          fi
+
+          echo "==> Recreate service: $DEPLOY_SERVICE"
+          "${COMPOSE[@]}" up -d --no-deps --force-recreate "$DEPLOY_SERVICE"
+
+          echo "==> Status"
+          "${COMPOSE[@]}" ps "$DEPLOY_SERVICE" || true
+          docker image ls --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}' | grep -F "$IMAGE_FULL" || true
+          echo "==> Done"
+          REMOTE
+
+      - name: Summary
+        run: |
+          {
+            echo "## Deployed"
+            echo ""
+            echo "- Host: \`${{ secrets.DEPLOY_HOST }}\`"
+            echo "- Path: \`${{ vars.DEPLOY_PATH }}\`"
+            echo "- Image: \`${{ steps.meta.outputs.full }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
