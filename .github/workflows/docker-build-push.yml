@@ -1,5 +1,4 @@
-# Build TokenFlow once, push to GHCR + Alibaba ACR (linux/amd64)
-# Manual only: the image_tag input is the primary image tag.
+# Build & push to GHCR only, then on MAGA: pull → retag → push to ACR.
 name: Docker Build & Push
 
 on:
@@ -29,10 +28,17 @@ env:
   ACR_REGISTRY: crpi-sk2z151c9de4cnvh.cn-hangzhou.personal.cr.aliyuncs.com
   ACR_NAMESPACE: fyinfor123
   ACR_REPO: tokenflow
+  MAGA_IP_DEFAULT: '65.49.196.156'
+  MAGA_USER_DEFAULT: root
 
 jobs:
-  build-push:
+  build-ghcr:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
+      acr_image: ${{ steps.meta.outputs.acr_image }}
+      push_latest: ${{ steps.meta.outputs.push_latest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,30 +52,27 @@ jobs:
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPO}"
 
-          # 手动填写的 tag 即为主镜像标签（去掉可选的 v 前缀）
           RAW_TAG="${{ inputs.image_tag }}"
-          RAW_TAG="${RAW_TAG#"${RAW_TAG%%[![:space:]]*}"}"
-          RAW_TAG="${RAW_TAG%"${RAW_TAG##*[![:space:]]}"}"
-          if [[ -z "$RAW_TAG" ]]; then
-            echo "image_tag is required" >&2
-            exit 1
-          fi
+          RAW_TAG="$(echo "$RAW_TAG" | xargs)"
+          [[ -n "$RAW_TAG" ]] || { echo "image_tag required" >&2; exit 1; }
           VERSION="${RAW_TAG#v}"
 
-          TAGS="${GHCR_IMAGE}:${VERSION},${ACR_IMAGE}:${VERSION}"
-          if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            TAGS="${TAGS},${GHCR_IMAGE}:latest,${ACR_IMAGE}:latest"
+          TAGS="${GHCR_IMAGE}:${VERSION}"
+          PUSH_LATEST="${{ inputs.push_latest }}"
+          if [[ "$PUSH_LATEST" == "true" ]]; then
+            TAGS="${TAGS},${GHCR_IMAGE}:latest"
           fi
 
           {
             echo "version=${VERSION}"
             echo "date=${DATE}"
+            echo "ghcr_image=${GHCR_IMAGE}"
             echo "acr_image=${ACR_IMAGE}"
             echo "tags=${TAGS}"
+            echo "push_latest=${PUSH_LATEST}"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Primary tag: ${VERSION}"
-          echo "Image tags: ${TAGS}"
+          echo "GHCR tags: ${TAGS}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -81,21 +84,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to ACR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.ACR_REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Build and push
+      - name: Build and push GHCR only
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: ${{ env.PLATFORMS }}
           push: true
-          # ACR 个人版不支持 OCI empty/provenance 证明清单
           provenance: false
           sbom: false
           tags: ${{ steps.meta.outputs.tags }}
@@ -113,20 +108,121 @@ jobs:
           cache-from: type=gha,scope=tokenflow-amd64
           cache-to: type=gha,mode=max,scope=tokenflow-amd64
 
+  sync-acr-via-maga:
+    needs: build-ghcr
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve MAGA host
+        id: host
+        run: |
+          set -euo pipefail
+          IP="${{ secrets.MAGA_IP }}"
+          USER="${{ secrets.MAGA_USER }}"
+          PORT="${{ secrets.MAGA_SSH_PORT }}"
+          [[ -n "$IP" ]] || IP="${{ env.MAGA_IP_DEFAULT }}"
+          [[ -n "$USER" ]] || USER="${{ env.MAGA_USER_DEFAULT }}"
+          [[ -n "$PORT" ]] || PORT="22"
+          {
+            echo "ip=${IP}"
+            echo "user=${USER}"
+            echo "port=${PORT}"
+          } >> "$GITHUB_OUTPUT"
+          echo "MAGA: ${USER}@${IP}:${PORT}"
+
+      - name: Prepare SSH
+        env:
+          MAGA_SSH_PRIVATE_KEY: ${{ secrets.MAGA_SSH_PRIVATE_KEY }}
+          HOST_IP: ${{ steps.host.outputs.ip }}
+          HOST_PORT: ${{ steps.host.outputs.port }}
+        run: |
+          set -euo pipefail
+          : "${MAGA_SSH_PRIVATE_KEY:?Missing secret MAGA_SSH_PRIVATE_KEY}"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$MAGA_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$HOST_PORT" -H "$HOST_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Pull from GHCR, retag, push to ACR on MAGA
+        env:
+          HOST_IP: ${{ steps.host.outputs.ip }}
+          HOST_USER: ${{ steps.host.outputs.user }}
+          HOST_PORT: ${{ steps.host.outputs.port }}
+          VERSION: ${{ needs.build-ghcr.outputs.version }}
+          GHCR_IMAGE: ${{ needs.build-ghcr.outputs.ghcr_image }}
+          ACR_IMAGE: ${{ needs.build-ghcr.outputs.acr_image }}
+          PUSH_LATEST: ${{ needs.build-ghcr.outputs.push_latest }}
+          ACR_REGISTRY: ${{ env.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${ACR_USERNAME:?Missing secret ACR_USERNAME}"
+          : "${ACR_PASSWORD:?Missing secret ACR_PASSWORD}"
+
+          SSH=(ssh -i ~/.ssh/deploy_key -p "$HOST_PORT"
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=accept-new
+            "${HOST_USER}@${HOST_IP}")
+
+          "${SSH[@]}" \
+            VERSION="$VERSION" \
+            GHCR_IMAGE="$GHCR_IMAGE" \
+            ACR_IMAGE="$ACR_IMAGE" \
+            PUSH_LATEST="$PUSH_LATEST" \
+            ACR_REGISTRY="$ACR_REGISTRY" \
+            ACR_USERNAME="$ACR_USERNAME" \
+            ACR_PASSWORD="$ACR_PASSWORD" \
+            GHCR_USER="$GHCR_USER" \
+            GHCR_TOKEN="$GHCR_TOKEN" \
+            bash -s <<'REMOTE'
+          set -euo pipefail
+
+          if docker info >/dev/null 2>&1; then
+            DOCKER=(docker)
+          elif sudo -n docker info >/dev/null 2>&1; then
+            DOCKER=(sudo docker)
+          else
+            echo "Cannot run docker on MAGA" >&2
+            exit 1
+          fi
+
+          echo "==> Login GHCR"
+          echo "$GHCR_TOKEN" | "${DOCKER[@]}" login ghcr.io -u "$GHCR_USER" --password-stdin
+
+          echo "==> Pull ${GHCR_IMAGE}:${VERSION}"
+          "${DOCKER[@]}" pull "${GHCR_IMAGE}:${VERSION}"
+
+          echo "==> Login ACR"
+          echo "$ACR_PASSWORD" | "${DOCKER[@]}" login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
+
+          echo "==> Tag & push ACR ${ACR_IMAGE}:${VERSION}"
+          "${DOCKER[@]}" tag "${GHCR_IMAGE}:${VERSION}" "${ACR_IMAGE}:${VERSION}"
+          "${DOCKER[@]}" push "${ACR_IMAGE}:${VERSION}"
+
+          if [[ "$PUSH_LATEST" == "true" ]]; then
+            echo "==> Tag & push ACR ${ACR_IMAGE}:latest"
+            "${DOCKER[@]}" tag "${GHCR_IMAGE}:${VERSION}" "${ACR_IMAGE}:latest"
+            "${DOCKER[@]}" push "${ACR_IMAGE}:latest"
+          fi
+
+          echo "==> Done"
+          "${DOCKER[@]}" image ls --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' \
+            | grep -E "tokenflow|REPOSITORY" || true
+          REMOTE
+
       - name: Summary
         run: |
-          VERSION="${{ steps.meta.outputs.version }}"
+          VERSION="${{ needs.build-ghcr.outputs.version }}"
           {
-            echo "## Images pushed (linux/amd64)"
+            echo "## Build & sync complete"
             echo ""
-            echo "主标签: \`${VERSION}\`"
+            echo "1. GitHub Actions → GHCR"
+            echo "2. MAGA pull GHCR → tag → push ACR"
             echo ""
             echo "\`\`\`bash"
-            echo "# GHCR"
-            echo "docker pull ${GHCR_IMAGE}:${VERSION}"
-            echo ""
-            echo "# ACR"
-            echo "docker login --username=\$ACR_USERNAME ${ACR_REGISTRY}"
-            echo "docker pull ${{ steps.meta.outputs.acr_image }}:${VERSION}"
+            echo "docker pull ${{ needs.build-ghcr.outputs.ghcr_image }}:${VERSION}"
+            echo "docker pull ${{ needs.build-ghcr.outputs.acr_image }}:${VERSION}"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
