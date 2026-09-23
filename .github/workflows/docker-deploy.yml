@@ -1,6 +1,5 @@
-# Deploy TokenFlow to MAGA server (ubuntu@119.91.154.55).
-# Syncs this repo's deploy/ into ~/TokenFlow/deploy on the server, then pulls & starts the image.
-name: 本地服务器IP_maga
+# Deploy TokenFlow to MAGA (本机) and/or tokease-slave (远程).
+name: Deploy TokenFlow
 
 on:
   workflow_dispatch:
@@ -9,6 +8,15 @@ on:
         description: '要部署的镜像标签（如 1.0.0 / latest）'
         required: true
         type: string
+      target:
+        description: '部署目标'
+        required: true
+        type: choice
+        options:
+          - maga
+          - tokease-slave
+          - both
+        default: maga
       registry:
         description: '镜像来源'
         required: true
@@ -19,7 +27,7 @@ on:
         default: acr
 
 concurrency:
-  group: deploy-tokenflow-maga
+  group: deploy-tokenflow-${{ inputs.target }}
   cancel-in-progress: false
 
 permissions:
@@ -30,29 +38,29 @@ env:
   ACR_REGISTRY: crpi-sk2z151c9de4cnvh.cn-hangzhou.personal.cr.aliyuncs.com
   ACR_NAMESPACE: fyinfor123
   ACR_REPO: tokenflow
-  # MAGA 服务器（可被 Secret 覆盖）
-  MAGA_IP: 119.91.154.55
-  MAGA_USER: ubuntu
-  # 与服务器上项目路径对齐：~/TokenFlow/deploy
   REMOTE_DIR: TokenFlow/deploy
+  # 本机 MAGA（可被 Secret 覆盖）
+  MAGA_IP_DEFAULT: '65.49.196.156'
+  MAGA_USER_DEFAULT: root
+  # 远程 tokease-slave（可被 Secret 覆盖）
+  TOKEASE_SLAVE_IP_DEFAULT: '119.91.154.55'
+  TOKEASE_SLAVE_USER_DEFAULT: ubuntu
 
 jobs:
-  deploy:
+  resolve:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      full: ${{ steps.meta.outputs.full }}
+      targets: ${{ steps.meta.outputs.targets }}
     steps:
-      - name: Checkout TokenFlow
-        uses: actions/checkout@v4
-
-      - name: Resolve image
+      - name: Resolve image & targets
         id: meta
         run: |
           set -euo pipefail
           RAW="$(echo "${{ inputs.image_tag }}" | xargs)"
           VERSION="${RAW#v}"
-          if [[ -z "$VERSION" ]]; then
-            echo "image_tag is required" >&2
-            exit 1
-          fi
+          [[ -n "$VERSION" ]] || { echo "image_tag required" >&2; exit 1; }
 
           if [[ "${{ inputs.registry }}" == "ghcr" ]]; then
             IMAGE="ghcr.io/${{ github.repository_owner }}/tokenflow"
@@ -60,59 +68,94 @@ jobs:
             IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPO}"
           fi
 
+          case "${{ inputs.target }}" in
+            maga) TARGETS='["maga"]' ;;
+            tokease-slave) TARGETS='["tokease-slave"]' ;;
+            both) TARGETS='["maga","tokease-slave"]' ;;
+            *) echo "unknown target" >&2; exit 1 ;;
+          esac
+
           {
             echo "version=${VERSION}"
             echo "full=${IMAGE}:${VERSION}"
+            echo "targets=${TARGETS}"
           } >> "$GITHUB_OUTPUT"
-          echo "Deploy TokenFlow image: ${IMAGE}:${VERSION}"
+          echo "Image=${IMAGE}:${VERSION} targets=${TARGETS}"
 
-      - name: Resolve MAGA target
-        id: target
+  deploy:
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve.outputs.targets) }}
+    steps:
+      - name: Checkout TokenFlow
+        uses: actions/checkout@v4
+
+      - name: Resolve host for ${{ matrix.target }}
+        id: host
         run: |
           set -euo pipefail
-          IP="${{ secrets.MAGA_IP }}"
-          USER="${{ secrets.MAGA_USER }}"
-          PORT="${{ secrets.MAGA_SSH_PORT }}"
-          [[ -n "$IP" ]] || IP="${{ env.MAGA_IP }}"
-          [[ -n "$USER" ]] || USER="${{ env.MAGA_USER }}"
+          TARGET="${{ matrix.target }}"
+          if [[ "$TARGET" == "maga" ]]; then
+            IP="${{ secrets.MAGA_IP }}"
+            USER="${{ secrets.MAGA_USER }}"
+            PORT="${{ secrets.MAGA_SSH_PORT }}"
+            [[ -n "$IP" ]] || IP="${{ env.MAGA_IP_DEFAULT }}"
+            [[ -n "$USER" ]] || USER="${{ env.MAGA_USER_DEFAULT }}"
+          else
+            IP="${{ secrets.TOKEASE_SLAVE_IP }}"
+            USER="${{ secrets.TOKEASE_SLAVE_USER }}"
+            PORT="${{ secrets.TOKEASE_SLAVE_SSH_PORT }}"
+            [[ -n "$IP" ]] || IP="${{ env.TOKEASE_SLAVE_IP_DEFAULT }}"
+            [[ -n "$USER" ]] || USER="${{ env.TOKEASE_SLAVE_USER_DEFAULT }}"
+          fi
           [[ -n "$PORT" ]] || PORT="22"
           {
             echo "ip=${IP}"
             echo "user=${USER}"
             echo "port=${PORT}"
           } >> "$GITHUB_OUTPUT"
-          echo "Target: ${USER}@${IP}:${PORT}"
+          echo "Deploy ${TARGET} -> ${USER}@${IP}:${PORT}"
 
       - name: Prepare SSH
         env:
-          MAGA_SSH_PRIVATE_KEY: ${{ secrets.MAGA_SSH_PRIVATE_KEY }}
-          MAGA_IP: ${{ steps.target.outputs.ip }}
-          MAGA_SSH_PORT: ${{ steps.target.outputs.port }}
+          MAGA_KEY: ${{ secrets.MAGA_SSH_PRIVATE_KEY }}
+          SLAVE_KEY: ${{ secrets.TOKEASE_SLAVE_SSH_PRIVATE_KEY }}
+          TARGET: ${{ matrix.target }}
+          HOST_IP: ${{ steps.host.outputs.ip }}
+          HOST_PORT: ${{ steps.host.outputs.port }}
         run: |
           set -euo pipefail
-          : "${MAGA_SSH_PRIVATE_KEY:?Missing secret MAGA_SSH_PRIVATE_KEY}"
-
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$MAGA_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          if [[ "$TARGET" == "maga" ]]; then
+            KEY="$MAGA_KEY"
+            KEY_NAME="MAGA_SSH_PRIVATE_KEY"
+          else
+            KEY="${SLAVE_KEY:-$MAGA_KEY}"
+            KEY_NAME="TOKEASE_SLAVE_SSH_PRIVATE_KEY or MAGA_SSH_PRIVATE_KEY"
+          fi
+          if [[ -z "$KEY" ]]; then
+            echo "Missing secret ${KEY_NAME}" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "$MAGA_SSH_PORT" -H "$MAGA_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p "$HOST_PORT" -H "$HOST_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Sync TokenFlow deploy/ to MAGA server
+      - name: Sync deploy/ to ${{ matrix.target }}
         env:
-          MAGA_IP: ${{ steps.target.outputs.ip }}
-          MAGA_USER: ${{ steps.target.outputs.user }}
-          MAGA_SSH_PORT: ${{ steps.target.outputs.port }}
+          HOST_IP: ${{ steps.host.outputs.ip }}
+          HOST_USER: ${{ steps.host.outputs.user }}
+          HOST_PORT: ${{ steps.host.outputs.port }}
           REMOTE_DIR: ${{ env.REMOTE_DIR }}
         run: |
           set -euo pipefail
-
-          SSH_OPTS=(-i ~/.ssh/deploy_key -p "$MAGA_SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
-          REMOTE="${MAGA_USER}@${MAGA_IP}"
-
+          SSH_OPTS=(-i ~/.ssh/deploy_key -p "$HOST_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+          REMOTE="${HOST_USER}@${HOST_IP}"
           ssh "${SSH_OPTS[@]}" "$REMOTE" "mkdir -p \"\$HOME/${REMOTE_DIR}\""
-
-          RSYNC_RSH="ssh -i ~/.ssh/deploy_key -p ${MAGA_SSH_PORT} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          RSYNC_RSH="ssh -i ~/.ssh/deploy_key -p ${HOST_PORT} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           rsync -az --delete \
             --exclude '.env' \
             --exclude 'data/' \
@@ -121,13 +164,13 @@ jobs:
             -e "$RSYNC_RSH" \
             deploy/ "${REMOTE}:~/${REMOTE_DIR}/"
 
-      - name: Pull image and start TokenFlow
+      - name: Pull image and start on ${{ matrix.target }}
         env:
-          MAGA_IP: ${{ steps.target.outputs.ip }}
-          MAGA_USER: ${{ steps.target.outputs.user }}
-          MAGA_SSH_PORT: ${{ steps.target.outputs.port }}
+          HOST_IP: ${{ steps.host.outputs.ip }}
+          HOST_USER: ${{ steps.host.outputs.user }}
+          HOST_PORT: ${{ steps.host.outputs.port }}
           REMOTE_DIR: ${{ env.REMOTE_DIR }}
-          IMAGE_FULL: ${{ steps.meta.outputs.full }}
+          IMAGE_FULL: ${{ needs.resolve.outputs.full }}
           REGISTRY_KIND: ${{ inputs.registry }}
           ACR_REGISTRY: ${{ env.ACR_REGISTRY }}
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
@@ -136,11 +179,10 @@ jobs:
           GHCR_USER: ${{ github.actor }}
         run: |
           set -euo pipefail
-
-          SSH=(ssh -i ~/.ssh/deploy_key -p "$MAGA_SSH_PORT"
+          SSH=(ssh -i ~/.ssh/deploy_key -p "$HOST_PORT"
             -o IdentitiesOnly=yes
             -o StrictHostKeyChecking=accept-new
-            "${MAGA_USER}@${MAGA_IP}")
+            "${HOST_USER}@${HOST_IP}")
 
           "${SSH[@]}" \
             REMOTE_DIR="$REMOTE_DIR" \
@@ -151,6 +193,7 @@ jobs:
             ACR_PASSWORD="$ACR_PASSWORD" \
             GHCR_USER="$GHCR_USER" \
             GHCR_TOKEN="$GHCR_TOKEN" \
+            TARGET_NAME="${{ matrix.target }}" \
             bash -s <<'REMOTE'
           set -euo pipefail
           cd "$HOME/$REMOTE_DIR"
@@ -160,7 +203,7 @@ jobs:
           elif sudo -n docker info >/dev/null 2>&1; then
             DOCKER=(sudo docker)
           else
-            echo "Cannot run docker (need docker group or passwordless sudo)" >&2
+            echo "Cannot run docker on ${TARGET_NAME}" >&2
             exit 1
           fi
 
@@ -184,7 +227,7 @@ jobs:
             echo "$ACR_PASSWORD" | "${DOCKER[@]}" login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
           fi
 
-          echo "==> Pull TokenFlow image: $IMAGE_FULL"
+          echo "==> Pull $IMAGE_FULL"
           "${DOCKER[@]}" pull "$IMAGE_FULL"
 
           printf '%s\n' \
@@ -204,21 +247,18 @@ jobs:
             fi
           fi
 
-          echo "==> Starting TokenFlow at $HOME/$REMOTE_DIR"
+          echo "==> Starting TokenFlow on ${TARGET_NAME} at $HOME/$REMOTE_DIR"
           "${COMPOSE[@]}" up -d
-
-          echo "==> Status"
           "${COMPOSE[@]}" ps
           "${DOCKER[@]}" ps --filter "name=tokenflow" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
-          echo "==> Done"
+          echo "==> Done (${TARGET_NAME})"
           REMOTE
 
       - name: Summary
         run: |
           {
-            echo "## TokenFlow deployed to MAGA"
-            echo ""
-            echo "- Host: \`${{ steps.target.outputs.user }}@${{ steps.target.outputs.ip }}\`"
-            echo "- Remote dir: \`~/${{ env.REMOTE_DIR }}\`"
-            echo "- Image: \`${{ steps.meta.outputs.full }}\`"
+            echo "## Deployed to \`${{ matrix.target }}\`"
+            echo "- Host: \`${{ steps.host.outputs.user }}@${{ steps.host.outputs.ip }}\`"
+            echo "- Dir: \`~/${{ env.REMOTE_DIR }}\`"
+            echo "- Image: \`${{ needs.resolve.outputs.full }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
