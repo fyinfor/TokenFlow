@@ -1,5 +1,5 @@
-# Deploy TokenFlow over SSH. Host/path auto-detected from running container — no Variables needed.
-# Secrets only: LOCAL_SERVER_IP_maga, DEPLOY_USER, DEPLOY_SSH_PRIVATE_KEY, ACR_*, optional DEPLOY_SSH_PORT
+# Deploy TokenFlow project to remote server over SSH (Secrets only, no Variables).
+# Syncs this repo's deploy/ to ~/tokenflow on the server, then pulls & starts the image.
 name: 本地服务器IP_maga
 
 on:
@@ -30,19 +30,21 @@ env:
   ACR_REGISTRY: crpi-sk2z151c9de4cnvh.cn-hangzhou.personal.cr.aliyuncs.com
   ACR_NAMESPACE: fyinfor123
   ACR_REPO: tokenflow
-  # 服务器上已有的应用容器名（用来自动定位 compose 目录）
-  APP_CONTAINER: sub2api
+  # 服务器上的固定部署目录（相对 SSH 用户家目录）
+  REMOTE_DIR: tokenflow
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout TokenFlow
+        uses: actions/checkout@v4
+
       - name: Resolve image
         id: meta
         run: |
           set -euo pipefail
-          RAW="${{ inputs.image_tag }}"
-          RAW="$(echo "$RAW" | xargs)"
+          RAW="$(echo "${{ inputs.image_tag }}" | xargs)"
           VERSION="${RAW#v}"
           if [[ -z "$VERSION" ]]; then
             echo "image_tag is required" >&2
@@ -57,38 +59,57 @@ jobs:
 
           {
             echo "version=${VERSION}"
-            echo "image=${IMAGE}"
             echo "full=${IMAGE}:${VERSION}"
           } >> "$GITHUB_OUTPUT"
-          echo "Deploy target: ${IMAGE}:${VERSION}"
+          echo "Deploy TokenFlow image: ${IMAGE}:${VERSION}"
 
-      - name: Prepare SSH key
+      - name: Prepare SSH
         env:
           DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          if [[ -z "${DEPLOY_SSH_PRIVATE_KEY}" ]]; then
-            echo "Missing secret DEPLOY_SSH_PRIVATE_KEY" >&2
-            exit 1
-          fi
+          : "${DEPLOY_SSH_PRIVATE_KEY:?Missing secret DEPLOY_SSH_PRIVATE_KEY}"
+          HOST="${{ secrets.LOCAL_SERVER_IP_maga }}"
+          PORT="${{ secrets.DEPLOY_SSH_PORT || '22' }}"
+          : "${HOST:?Missing secret LOCAL_SERVER_IP_maga}"
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-
-          HOST="${{ secrets.LOCAL_SERVER_IP_maga }}"
-          PORT="${{ secrets.DEPLOY_SSH_PORT || '22' }}"
-          if [[ -z "$HOST" ]]; then
-            echo "Missing secret LOCAL_SERVER_IP_maga" >&2
-            exit 1
-          fi
           ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Deploy over SSH
+      - name: Sync TokenFlow deploy/ to server
         env:
           LOCAL_SERVER_IP_maga: ${{ secrets.LOCAL_SERVER_IP_maga }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+          REMOTE_DIR: ${{ env.REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_USER:?Missing secret DEPLOY_USER}"
+
+          SSH_OPTS=(-i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+          REMOTE="${DEPLOY_USER}@${LOCAL_SERVER_IP_maga}"
+
+          ssh "${SSH_OPTS[@]}" "$REMOTE" "mkdir -p \"\$HOME/${REMOTE_DIR}\""
+
+          # 同步本仓库 deploy 目录；不覆盖服务器已有 .env
+          RSYNC_RSH="ssh -i ~/.ssh/deploy_key -p ${DEPLOY_SSH_PORT} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          rsync -az --delete \
+            --exclude '.env' \
+            --exclude 'data/' \
+            --exclude 'postgres_data/' \
+            --exclude 'redis_data/' \
+            -e "$RSYNC_RSH" \
+            deploy/ "${REMOTE}:~/${REMOTE_DIR}/"
+
+      - name: Pull image and start TokenFlow
+        env:
+          LOCAL_SERVER_IP_maga: ${{ secrets.LOCAL_SERVER_IP_maga }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+          REMOTE_DIR: ${{ env.REMOTE_DIR }}
           IMAGE_FULL: ${{ steps.meta.outputs.full }}
           REGISTRY_KIND: ${{ inputs.registry }}
           ACR_REGISTRY: ${{ env.ACR_REGISTRY }}
@@ -96,12 +117,8 @@ jobs:
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
-          APP_CONTAINER: ${{ env.APP_CONTAINER }}
         run: |
           set -euo pipefail
-
-          : "${LOCAL_SERVER_IP_maga:?set secret LOCAL_SERVER_IP_maga}"
-          : "${DEPLOY_USER:?set secret DEPLOY_USER}"
 
           SSH=(ssh -i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT"
             -o IdentitiesOnly=yes
@@ -109,6 +126,7 @@ jobs:
             "${DEPLOY_USER}@${LOCAL_SERVER_IP_maga}")
 
           "${SSH[@]}" \
+            REMOTE_DIR="$REMOTE_DIR" \
             IMAGE_FULL="$IMAGE_FULL" \
             REGISTRY_KIND="$REGISTRY_KIND" \
             ACR_REGISTRY="$ACR_REGISTRY" \
@@ -116,40 +134,32 @@ jobs:
             ACR_PASSWORD="$ACR_PASSWORD" \
             GHCR_USER="$GHCR_USER" \
             GHCR_TOKEN="$GHCR_TOKEN" \
-            APP_CONTAINER="$APP_CONTAINER" \
             bash -s <<'REMOTE'
           set -euo pipefail
+          cd "$HOME/$REMOTE_DIR"
 
           if docker info >/dev/null 2>&1; then
             DOCKER=(docker)
           elif sudo -n docker info >/dev/null 2>&1; then
             DOCKER=(sudo docker)
           else
-            echo "Cannot run docker on remote host (need docker or passwordless sudo)" >&2
+            echo "Cannot run docker (need docker group or passwordless sudo)" >&2
             exit 1
           fi
 
-          if ! "${DOCKER[@]}" inspect "$APP_CONTAINER" >/dev/null 2>&1; then
-            echo "Container '$APP_CONTAINER' not found on server" >&2
-            exit 1
+          # 首次部署：从示例生成 .env（不覆盖已有配置）
+          if [[ ! -f .env ]]; then
+            cp .env.example .env
+            PW="$(openssl rand -hex 16)"
+            JWT="$(openssl rand -hex 32)"
+            sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${PW}/" .env
+            if grep -q '^JWT_SECRET=' .env; then
+              sed -i "s/^JWT_SECRET=.*/JWT_SECRET=${JWT}/" .env
+            else
+              echo "JWT_SECRET=${JWT}" >> .env
+            fi
+            echo "==> Created .env with generated secrets"
           fi
-
-          DEPLOY_PATH="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$APP_CONTAINER")"
-          CONFIG_FILES="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$APP_CONTAINER")"
-          DEPLOY_SERVICE="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$APP_CONTAINER")"
-          DEPLOY_COMPOSE_FILE="${CONFIG_FILES%%,*}"
-          DEPLOY_COMPOSE_FILE="$(basename "$DEPLOY_COMPOSE_FILE")"
-
-          if [[ -z "$DEPLOY_PATH" || -z "$DEPLOY_SERVICE" ]]; then
-            echo "Container '$APP_CONTAINER' is not managed by docker compose (missing labels)" >&2
-            exit 1
-          fi
-
-          echo "==> Auto-detected"
-          echo "    path:    $DEPLOY_PATH"
-          echo "    compose: $DEPLOY_COMPOSE_FILE"
-          echo "    service: $DEPLOY_SERVICE"
-          cd "$DEPLOY_PATH"
 
           echo "==> Docker login ($REGISTRY_KIND)"
           if [[ "$REGISTRY_KIND" == "ghcr" ]]; then
@@ -158,41 +168,42 @@ jobs:
             echo "$ACR_PASSWORD" | "${DOCKER[@]}" login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
           fi
 
-          echo "==> Pull $IMAGE_FULL"
+          echo "==> Pull TokenFlow image: $IMAGE_FULL"
           "${DOCKER[@]}" pull "$IMAGE_FULL"
 
+          # 用 TokenFlow 镜像覆盖 compose 里默认的 weishaw/sub2api
           printf '%s\n' \
             "services:" \
-            "  ${DEPLOY_SERVICE}:" \
+            "  sub2api:" \
             "    image: ${IMAGE_FULL}" \
+            "    container_name: tokenflow" \
             > docker-compose.tokenflow.override.yml
 
           if "${DOCKER[@]}" compose version >/dev/null 2>&1; then
-            COMPOSE=("${DOCKER[@]}" compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+            COMPOSE=("${DOCKER[@]}" compose -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
           else
-            # legacy docker-compose binary
             if [[ "${DOCKER[*]}" == "sudo docker" ]]; then
-              COMPOSE=(sudo docker-compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+              COMPOSE=(sudo docker-compose -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
             else
-              COMPOSE=(docker-compose -f "$DEPLOY_COMPOSE_FILE" -f docker-compose.tokenflow.override.yml)
+              COMPOSE=(docker-compose -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
             fi
           fi
 
-          echo "==> Recreate service: $DEPLOY_SERVICE"
-          "${COMPOSE[@]}" up -d --no-deps --force-recreate "$DEPLOY_SERVICE"
+          echo "==> Starting TokenFlow at $HOME/$REMOTE_DIR"
+          "${COMPOSE[@]}" up -d
 
           echo "==> Status"
-          "${COMPOSE[@]}" ps "$DEPLOY_SERVICE" || true
-          "${DOCKER[@]}" ps --filter "name=^/${APP_CONTAINER}$" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+          "${COMPOSE[@]}" ps
+          "${DOCKER[@]}" ps --filter "name=tokenflow" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
           echo "==> Done"
           REMOTE
 
       - name: Summary
         run: |
           {
-            echo "## Deployed"
+            echo "## TokenFlow deployed"
             echo ""
             echo "- Host: \`${{ secrets.LOCAL_SERVER_IP_maga }}\`"
+            echo "- Remote dir: \`~/${{ env.REMOTE_DIR }}\`"
             echo "- Image: \`${{ steps.meta.outputs.full }}\`"
-            echo "- Path/service: auto-detected from container \`sub2api\`"
           } >> "$GITHUB_STEP_SUMMARY"
