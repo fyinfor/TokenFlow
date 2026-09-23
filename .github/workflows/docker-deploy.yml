@@ -65,37 +65,37 @@ jobs:
 
       - name: Prepare SSH
         env:
-          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          MAGA_SSH_PRIVATE_KEY: ${{ secrets.MAGA_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          : "${DEPLOY_SSH_PRIVATE_KEY:?Missing secret DEPLOY_SSH_PRIVATE_KEY}"
-          HOST="${{ secrets.LOCAL_SERVER_IP_maga }}"
-          PORT="${{ secrets.DEPLOY_SSH_PORT || '22' }}"
-          : "${HOST:?Missing secret LOCAL_SERVER_IP_maga}"
+          : "${MAGA_SSH_PRIVATE_KEY:?Missing secret MAGA_SSH_PRIVATE_KEY}"
+          HOST="${{ secrets.MAGA_IP }}"
+          PORT="${{ secrets.MAGA_SSH_PORT || '22' }}"
+          : "${HOST:?Missing secret MAGA_IP}"
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$MAGA_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
       - name: Sync TokenFlow deploy/ to server
         env:
-          LOCAL_SERVER_IP_maga: ${{ secrets.LOCAL_SERVER_IP_maga }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+          MAGA_IP: ${{ secrets.MAGA_IP }}
+          MAGA_USER: ${{ secrets.MAGA_USER }}
+          MAGA_SSH_PORT: ${{ secrets.MAGA_SSH_PORT || '22' }}
           REMOTE_DIR: ${{ env.REMOTE_DIR }}
         run: |
           set -euo pipefail
-          : "${DEPLOY_USER:?Missing secret DEPLOY_USER}"
+          : "${MAGA_USER:?Missing secret MAGA_USER}"
 
-          SSH_OPTS=(-i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
-          REMOTE="${DEPLOY_USER}@${LOCAL_SERVER_IP_maga}"
+          SSH_OPTS=(-i ~/.ssh/deploy_key -p "$MAGA_SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+          REMOTE="${MAGA_USER}@${MAGA_IP}"
 
           ssh "${SSH_OPTS[@]}" "$REMOTE" "mkdir -p \"\$HOME/${REMOTE_DIR}\""
 
           # 同步本仓库 deploy 目录；不覆盖服务器已有 .env
-          RSYNC_RSH="ssh -i ~/.ssh/deploy_key -p ${DEPLOY_SSH_PORT} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          RSYNC_RSH="ssh -i ~/.ssh/deploy_key -p ${MAGA_SSH_PORT} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           rsync -az --delete \
             --exclude '.env' \
             --exclude 'data/' \
@@ -106,9 +106,9 @@ jobs:
 
       - name: Pull image and start TokenFlow
         env:
-          LOCAL_SERVER_IP_maga: ${{ secrets.LOCAL_SERVER_IP_maga }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+          MAGA_IP: ${{ secrets.MAGA_IP }}
+          MAGA_USER: ${{ secrets.MAGA_USER }}
+          MAGA_SSH_PORT: ${{ secrets.MAGA_SSH_PORT || '22' }}
           REMOTE_DIR: ${{ env.REMOTE_DIR }}
           IMAGE_FULL: ${{ steps.meta.outputs.full }}
           REGISTRY_KIND: ${{ inputs.registry }}
@@ -120,10 +120,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          SSH=(ssh -i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT"
+          SSH=(ssh -i ~/.ssh/deploy_key -p "$MAGA_SSH_PORT"
             -o IdentitiesOnly=yes
             -o StrictHostKeyChecking=accept-new
-            "${DEPLOY_USER}@${LOCAL_SERVER_IP_maga}")
+            "${MAGA_USER}@${MAGA_IP}")
 
           "${SSH[@]}" \
             REMOTE_DIR="$REMOTE_DIR" \
@@ -203,7 +203,7 @@ jobs:
           {
             echo "## TokenFlow deployed"
             echo ""
-            echo "- Host: \`${{ secrets.LOCAL_SERVER_IP_maga }}\`"
+            echo "- Host: \`${{ secrets.MAGA_IP }}\`"
             echo "- Remote dir: \`~/${{ env.REMOTE_DIR }}\`"
             echo "- Image: \`${{ steps.meta.outputs.full }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
