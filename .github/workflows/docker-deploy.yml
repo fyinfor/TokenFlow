@@ -1,6 +1,6 @@
 # Deploy TokenFlow to a remote host over SSH (key auth).
 # Configure host/path/credentials in GitHub Settings → Secrets and variables → Actions.
-name: Deploy
+name: 本地服务器IP_maga
 
 on:
   workflow_dispatch:
