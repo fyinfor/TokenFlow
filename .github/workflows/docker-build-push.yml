@@ -95,6 +95,9 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ env.PLATFORMS }}
           push: true
+          # ACR 个人版不支持 OCI empty/provenance 证明清单
+          provenance: false
+          sbom: false
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
