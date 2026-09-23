@@ -237,6 +237,7 @@ jobs:
           echo "==> Pull $IMAGE_FULL"
           "${DOCKER[@]}" pull "$IMAGE_FULL"
 
+          # 只覆盖应用镜像；postgres/redis 沿用 compose 原名
           printf '%s\n' \
             'services:' \
             '  sub2api:' \
@@ -244,19 +245,33 @@ jobs:
             '    container_name: tokenflow' \
             > docker-compose.tokenflow.override.yml
 
-          export COMPOSE_PROJECT_NAME=tokenflow
+          # 重复部署必须沿用已有 compose project，否则会因 container_name 冲突失败
+          PROJECT="tokenflow"
+          if "${DOCKER[@]}" inspect tokenflow >/dev/null 2>&1; then
+            PROJECT="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' tokenflow)"
+          elif "${DOCKER[@]}" inspect sub2api-redis >/dev/null 2>&1; then
+            PROJECT="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' sub2api-redis)"
+          elif "${DOCKER[@]}" inspect sub2api >/dev/null 2>&1; then
+            PROJECT="$("${DOCKER[@]}" inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' sub2api)"
+          fi
+          [[ -n "$PROJECT" && "$PROJECT" != "<no value>" ]] || PROJECT="tokenflow"
+          echo "==> Compose project: ${PROJECT}"
+
           if "${DOCKER[@]}" compose version >/dev/null 2>&1; then
-            COMPOSE=("${DOCKER[@]}" compose -p tokenflow -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
+            COMPOSE=("${DOCKER[@]}" compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
           else
             if [[ "${DOCKER[*]}" == "sudo docker" ]]; then
-              COMPOSE=(sudo env COMPOSE_PROJECT_NAME=tokenflow docker-compose -p tokenflow -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
+              COMPOSE=(sudo docker-compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
             else
-              COMPOSE=(env COMPOSE_PROJECT_NAME=tokenflow docker-compose -p tokenflow -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
+              COMPOSE=(docker-compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.tokenflow.override.yml)
             fi
           fi
 
-          echo "==> Starting TokenFlow on ${TARGET_NAME} at $HOME/$REMOTE_DIR (port 8080)"
-          "${COMPOSE[@]}" up -d
+          echo "==> Starting/updating TokenFlow on ${TARGET_NAME} at $HOME/$REMOTE_DIR (port 8080)"
+          # 先保证依赖在跑，再强制重建应用容器以切换镜像（不新建同名 postgres/redis）
+          "${COMPOSE[@]}" up -d postgres redis
+          "${COMPOSE[@]}" up -d --no-deps --force-recreate sub2api
+          "${COMPOSE[@]}" up -d --remove-orphans
           "${COMPOSE[@]}" ps
           "${DOCKER[@]}" ps --filter "name=tokenflow" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
           echo "==> Done (${TARGET_NAME})"
