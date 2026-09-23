@@ -1,4 +1,7 @@
-# Deploy TokenFlow to MAGA (本机) and/or tokease-slave (远程).
+# Deploy TokenFlow:
+# - maga (本机) → GHCR 镜像
+# - tokease-slave (远程) → ACR 镜像
+# 默认两台一起部署，可选手动目标；slave 使用独立 SSH 密钥。
 name: Deploy TokenFlow
 
 on:
@@ -9,22 +12,14 @@ on:
         required: true
         type: string
       target:
-        description: '部署目标'
+        description: '部署目标（默认两台一起）'
         required: true
         type: choice
         options:
+          - both
           - maga
           - tokease-slave
-          - both
-        default: maga
-      registry:
-        description: '镜像来源'
-        required: true
-        type: choice
-        options:
-          - acr
-          - ghcr
-        default: acr
+        default: both
 
 concurrency:
   group: deploy-tokenflow-${{ inputs.target }}
@@ -38,11 +33,10 @@ env:
   ACR_REGISTRY: crpi-sk2z151c9de4cnvh.cn-hangzhou.personal.cr.aliyuncs.com
   ACR_NAMESPACE: fyinfor123
   ACR_REPO: tokenflow
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/tokenflow
   REMOTE_DIR: TokenFlow/deploy
-  # 本机 MAGA（可被 Secret 覆盖）
   MAGA_IP_DEFAULT: '65.49.196.156'
   MAGA_USER_DEFAULT: root
-  # 远程 tokease-slave（可被 Secret 覆盖）
   TOKEASE_SLAVE_IP_DEFAULT: '119.91.154.55'
   TOKEASE_SLAVE_USER_DEFAULT: ubuntu
 
@@ -51,10 +45,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
-      full: ${{ steps.meta.outputs.full }}
       targets: ${{ steps.meta.outputs.targets }}
+      ghcr_full: ${{ steps.meta.outputs.ghcr_full }}
+      acr_full: ${{ steps.meta.outputs.acr_full }}
     steps:
-      - name: Resolve image & targets
+      - name: Resolve version & targets
         id: meta
         run: |
           set -euo pipefail
@@ -62,11 +57,7 @@ jobs:
           VERSION="${RAW#v}"
           [[ -n "$VERSION" ]] || { echo "image_tag required" >&2; exit 1; }
 
-          if [[ "${{ inputs.registry }}" == "ghcr" ]]; then
-            IMAGE="ghcr.io/${{ github.repository_owner }}/tokenflow"
-          else
-            IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPO}"
-          fi
+          ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPO}"
 
           case "${{ inputs.target }}" in
             maga) TARGETS='["maga"]' ;;
@@ -77,10 +68,13 @@ jobs:
 
           {
             echo "version=${VERSION}"
-            echo "full=${IMAGE}:${VERSION}"
             echo "targets=${TARGETS}"
+            echo "ghcr_full=${GHCR_IMAGE}:${VERSION}"
+            echo "acr_full=${ACR_IMAGE}:${VERSION}"
           } >> "$GITHUB_OUTPUT"
-          echo "Image=${IMAGE}:${VERSION} targets=${TARGETS}"
+          echo "version=${VERSION} targets=${TARGETS}"
+          echo "maga  -> ${GHCR_IMAGE}:${VERSION}"
+          echo "slave -> ${ACR_IMAGE}:${VERSION}"
 
   deploy:
     needs: resolve
@@ -93,7 +87,7 @@ jobs:
       - name: Checkout TokenFlow
         uses: actions/checkout@v4
 
-      - name: Resolve host for ${{ matrix.target }}
+      - name: Resolve host & image for ${{ matrix.target }}
         id: host
         run: |
           set -euo pipefail
@@ -104,20 +98,26 @@ jobs:
             PORT="${{ secrets.MAGA_SSH_PORT }}"
             [[ -n "$IP" ]] || IP="${{ env.MAGA_IP_DEFAULT }}"
             [[ -n "$USER" ]] || USER="${{ env.MAGA_USER_DEFAULT }}"
+            IMAGE_FULL="${{ needs.resolve.outputs.ghcr_full }}"
+            REGISTRY_KIND="ghcr"
           else
             IP="${{ secrets.TOKEASE_SLAVE_IP }}"
             USER="${{ secrets.TOKEASE_SLAVE_USER }}"
             PORT="${{ secrets.TOKEASE_SLAVE_SSH_PORT }}"
             [[ -n "$IP" ]] || IP="${{ env.TOKEASE_SLAVE_IP_DEFAULT }}"
             [[ -n "$USER" ]] || USER="${{ env.TOKEASE_SLAVE_USER_DEFAULT }}"
+            IMAGE_FULL="${{ needs.resolve.outputs.acr_full }}"
+            REGISTRY_KIND="acr"
           fi
           [[ -n "$PORT" ]] || PORT="22"
           {
             echo "ip=${IP}"
             echo "user=${USER}"
             echo "port=${PORT}"
+            echo "image_full=${IMAGE_FULL}"
+            echo "registry_kind=${REGISTRY_KIND}"
           } >> "$GITHUB_OUTPUT"
-          echo "Deploy ${TARGET} -> ${USER}@${IP}:${PORT}"
+          echo "Deploy ${TARGET} -> ${USER}@${IP}:${PORT} image=${IMAGE_FULL}"
 
       - name: Prepare SSH
         env:
@@ -132,8 +132,8 @@ jobs:
             KEY="$MAGA_KEY"
             KEY_NAME="MAGA_SSH_PRIVATE_KEY"
           else
-            KEY="${SLAVE_KEY:-$MAGA_KEY}"
-            KEY_NAME="TOKEASE_SLAVE_SSH_PRIVATE_KEY or MAGA_SSH_PRIVATE_KEY"
+            KEY="$SLAVE_KEY"
+            KEY_NAME="TOKEASE_SLAVE_SSH_PRIVATE_KEY"
           fi
           if [[ -z "$KEY" ]]; then
             echo "Missing secret ${KEY_NAME}" >&2
@@ -170,8 +170,8 @@ jobs:
           HOST_USER: ${{ steps.host.outputs.user }}
           HOST_PORT: ${{ steps.host.outputs.port }}
           REMOTE_DIR: ${{ env.REMOTE_DIR }}
-          IMAGE_FULL: ${{ needs.resolve.outputs.full }}
-          REGISTRY_KIND: ${{ inputs.registry }}
+          IMAGE_FULL: ${{ steps.host.outputs.image_full }}
+          REGISTRY_KIND: ${{ steps.host.outputs.registry_kind }}
           ACR_REGISTRY: ${{ env.ACR_REGISTRY }}
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
@@ -220,10 +220,12 @@ jobs:
             echo "==> Created .env with generated secrets"
           fi
 
-          echo "==> Docker login ($REGISTRY_KIND)"
+          echo "==> Docker login ($REGISTRY_KIND) for ${TARGET_NAME}"
           if [[ "$REGISTRY_KIND" == "ghcr" ]]; then
             echo "$GHCR_TOKEN" | "${DOCKER[@]}" login ghcr.io -u "$GHCR_USER" --password-stdin
           else
+            : "${ACR_USERNAME:?Missing ACR_USERNAME}"
+            : "${ACR_PASSWORD:?Missing ACR_PASSWORD}"
             echo "$ACR_PASSWORD" | "${DOCKER[@]}" login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
           fi
 
@@ -259,6 +261,7 @@ jobs:
           {
             echo "## Deployed to \`${{ matrix.target }}\`"
             echo "- Host: \`${{ steps.host.outputs.user }}@${{ steps.host.outputs.ip }}\`"
+            echo "- Registry: \`${{ steps.host.outputs.registry_kind }}\`"
+            echo "- Image: \`${{ steps.host.outputs.image_full }}\`"
             echo "- Dir: \`~/${{ env.REMOTE_DIR }}\`"
-            echo "- Image: \`${{ needs.resolve.outputs.full }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
