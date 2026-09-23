@@ -74,17 +74,17 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-          HOST="${{ secrets.DEPLOY_HOST }}"
+          HOST="${{ secrets.LOCAL_SERVER_IP_maga }}"
           PORT="${{ secrets.DEPLOY_SSH_PORT || '22' }}"
           if [[ -z "$HOST" ]]; then
-            echo "Missing secret DEPLOY_HOST" >&2
+            echo "Missing secret LOCAL_SERVER_IP_maga" >&2
             exit 1
           fi
           ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
       - name: Deploy over SSH
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          LOCAL_SERVER_IP_maga: ${{ secrets.LOCAL_SERVER_IP_maga }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
@@ -100,14 +100,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          : "${DEPLOY_HOST:?set secret DEPLOY_HOST}"
+          : "${LOCAL_SERVER_IP_maga:?set secret LOCAL_SERVER_IP_maga}"
           : "${DEPLOY_USER:?set secret DEPLOY_USER}"
           : "${DEPLOY_PATH:?set variable DEPLOY_PATH}"
 
           SSH=(ssh -i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT"
             -o IdentitiesOnly=yes
             -o StrictHostKeyChecking=accept-new
-            "${DEPLOY_USER}@${DEPLOY_HOST}")
+            "${DEPLOY_USER}@${LOCAL_SERVER_IP_maga}")
 
           # Pass only needed values into the remote shell
           "${SSH[@]}" \
@@ -163,7 +163,7 @@ jobs:
           {
             echo "## Deployed"
             echo ""
-            echo "- Host: \`${{ secrets.DEPLOY_HOST }}\`"
+            echo "- Host: \`${{ secrets.LOCAL_SERVER_IP_maga }}\`"
             echo "- Path: \`${{ vars.DEPLOY_PATH }}\`"
             echo "- Image: \`${{ steps.meta.outputs.full }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
