@@ -1,5 +1,5 @@
-# Deploy TokenFlow project to remote server over SSH (Secrets only, no Variables).
-# Syncs this repo's deploy/ to ~/tokenflow on the server, then pulls & starts the image.
+# Deploy TokenFlow to MAGA server (ubuntu@119.91.154.55).
+# Syncs this repo's deploy/ into ~/TokenFlow/deploy on the server, then pulls & starts the image.
 name: 本地服务器IP_maga
 
 on:
@@ -19,7 +19,7 @@ on:
         default: acr
 
 concurrency:
-  group: deploy-tokenflow
+  group: deploy-tokenflow-maga
   cancel-in-progress: false
 
 permissions:
@@ -30,8 +30,11 @@ env:
   ACR_REGISTRY: crpi-sk2z151c9de4cnvh.cn-hangzhou.personal.cr.aliyuncs.com
   ACR_NAMESPACE: fyinfor123
   ACR_REPO: tokenflow
-  # 服务器上的固定部署目录（相对 SSH 用户家目录）
-  REMOTE_DIR: tokenflow
+  # MAGA 服务器（可被 Secret 覆盖）
+  MAGA_IP: 119.91.154.55
+  MAGA_USER: ubuntu
+  # 与服务器上项目路径对齐：~/TokenFlow/deploy
+  REMOTE_DIR: TokenFlow/deploy
 
 jobs:
   deploy:
@@ -63,38 +66,52 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Deploy TokenFlow image: ${IMAGE}:${VERSION}"
 
+      - name: Resolve MAGA target
+        id: target
+        run: |
+          set -euo pipefail
+          IP="${{ secrets.MAGA_IP }}"
+          USER="${{ secrets.MAGA_USER }}"
+          PORT="${{ secrets.MAGA_SSH_PORT }}"
+          [[ -n "$IP" ]] || IP="${{ env.MAGA_IP }}"
+          [[ -n "$USER" ]] || USER="${{ env.MAGA_USER }}"
+          [[ -n "$PORT" ]] || PORT="22"
+          {
+            echo "ip=${IP}"
+            echo "user=${USER}"
+            echo "port=${PORT}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Target: ${USER}@${IP}:${PORT}"
+
       - name: Prepare SSH
         env:
           MAGA_SSH_PRIVATE_KEY: ${{ secrets.MAGA_SSH_PRIVATE_KEY }}
+          MAGA_IP: ${{ steps.target.outputs.ip }}
+          MAGA_SSH_PORT: ${{ steps.target.outputs.port }}
         run: |
           set -euo pipefail
           : "${MAGA_SSH_PRIVATE_KEY:?Missing secret MAGA_SSH_PRIVATE_KEY}"
-          HOST="${{ secrets.MAGA_IP }}"
-          PORT="${{ secrets.MAGA_SSH_PORT || '22' }}"
-          : "${HOST:?Missing secret MAGA_IP}"
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           printf '%s\n' "$MAGA_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "$PORT" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p "$MAGA_SSH_PORT" -H "$MAGA_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Sync TokenFlow deploy/ to server
+      - name: Sync TokenFlow deploy/ to MAGA server
         env:
-          MAGA_IP: ${{ secrets.MAGA_IP }}
-          MAGA_USER: ${{ secrets.MAGA_USER }}
-          MAGA_SSH_PORT: ${{ secrets.MAGA_SSH_PORT || '22' }}
+          MAGA_IP: ${{ steps.target.outputs.ip }}
+          MAGA_USER: ${{ steps.target.outputs.user }}
+          MAGA_SSH_PORT: ${{ steps.target.outputs.port }}
           REMOTE_DIR: ${{ env.REMOTE_DIR }}
         run: |
           set -euo pipefail
-          : "${MAGA_USER:?Missing secret MAGA_USER}"
 
           SSH_OPTS=(-i ~/.ssh/deploy_key -p "$MAGA_SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
           REMOTE="${MAGA_USER}@${MAGA_IP}"
 
           ssh "${SSH_OPTS[@]}" "$REMOTE" "mkdir -p \"\$HOME/${REMOTE_DIR}\""
 
-          # 同步本仓库 deploy 目录；不覆盖服务器已有 .env
           RSYNC_RSH="ssh -i ~/.ssh/deploy_key -p ${MAGA_SSH_PORT} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           rsync -az --delete \
             --exclude '.env' \
@@ -106,9 +123,9 @@ jobs:
 
       - name: Pull image and start TokenFlow
         env:
-          MAGA_IP: ${{ secrets.MAGA_IP }}
-          MAGA_USER: ${{ secrets.MAGA_USER }}
-          MAGA_SSH_PORT: ${{ secrets.MAGA_SSH_PORT || '22' }}
+          MAGA_IP: ${{ steps.target.outputs.ip }}
+          MAGA_USER: ${{ steps.target.outputs.user }}
+          MAGA_SSH_PORT: ${{ steps.target.outputs.port }}
           REMOTE_DIR: ${{ env.REMOTE_DIR }}
           IMAGE_FULL: ${{ steps.meta.outputs.full }}
           REGISTRY_KIND: ${{ inputs.registry }}
@@ -147,7 +164,6 @@ jobs:
             exit 1
           fi
 
-          # 首次部署：从示例生成 .env（不覆盖已有配置）
           if [[ ! -f .env ]]; then
             cp .env.example .env
             PW="$(openssl rand -hex 16)"
@@ -171,7 +187,6 @@ jobs:
           echo "==> Pull TokenFlow image: $IMAGE_FULL"
           "${DOCKER[@]}" pull "$IMAGE_FULL"
 
-          # 用 TokenFlow 镜像覆盖 compose 里默认的 weishaw/sub2api
           printf '%s\n' \
             "services:" \
             "  sub2api:" \
@@ -201,9 +216,9 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "## TokenFlow deployed"
+            echo "## TokenFlow deployed to MAGA"
             echo ""
-            echo "- Host: \`${{ secrets.MAGA_IP }}\`"
+            echo "- Host: \`${{ steps.target.outputs.user }}@${{ steps.target.outputs.ip }}\`"
             echo "- Remote dir: \`~/${{ env.REMOTE_DIR }}\`"
             echo "- Image: \`${{ steps.meta.outputs.full }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
